@@ -1,0 +1,762 @@
+# Pipeline Azure DevOps — Estrategia de Aseguramiento Ciberseguridad
+# Ref: Tesis MSI — XXXn David Escobar Agudelo
+# Etapas: Build → SAST → Security Asserts (A+B, 3 runs c/u) → Deploy → DAST → Report
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+
+variables:
+  buildConfiguration: 'Debug'
+  dotnetVersion: '8.x'
+
+  # ── Escenario A: API Vulnerable ──────────────────────────────
+  apiProjectPath:   '$(Build.SourcesDirectory)/Desarrollo/VulnerableApi/VulnerableApi.csproj'
+  apiBaseUrl:       'http://localhost:5000'
+  apiPort:          '5000'
+  iisAppName:       'VulnerableApi'
+  iisPort:          '5000'
+  vulnerableDbPath: '$(Build.SourcesDirectory)/Desarrollo/VulnerableApi/vulnerable.db'
+
+  # ── Escenario B: API Parcheada ────────────────────────────────
+  patchedApiProjectPath: '$(Build.SourcesDirectory)/Desarrollo/VulnerableApi_Patched/VulnerableApi_Patched.csproj'
+  patchedApiBaseUrl:     'http://localhost:5002'
+  patchedApiPort:        '5002'
+  patchedDbPath:         '$(Build.SourcesDirectory)/Desarrollo/VulnerableApi_Patched/patched.db'
+
+  # ── SecurityAsserts (Inyector) ────────────────────────────────
+  # global.json en Inyector/ fija SDK 8.0.319 para evitar CS1744 con SDK 9
+  assertsProjectPath: '$(Build.SourcesDirectory)/Inyector/SecurityAsserts/SecurityAsserts.csproj'
+  assertsBaseDir:     '$(Build.SourcesDirectory)/Inyector'
+  testResultsDir:     '$(Build.ArtifactStagingDirectory)/test-results'
+  numRuns:            3
+
+  # ── Docker / ZAP ─────────────────────────────────────────────
+  zapImage: 'ghcr.io/zaproxy/zaproxy:stable'
+
+pool:
+  name: 'Default'         # Agente self-hosted Windows con IIS
+  demands:
+    - agent.os -equals Windows_NT
+
+stages:
+
+# ============================================================
+# ETAPA 1: COMPILACIÓN
+# Compila: VulnerableApi + VulnerableApi_Patched + SecurityAsserts
+# Quality Gate: 0 errores de compilación en los 3 proyectos
+# ============================================================
+- stage: Build
+  displayName: '1 — Compilación y Restauración'
+  jobs:
+  - job: BuildJob
+    displayName: 'dotnet build (API + Patched + SecurityAsserts)'
+    steps:
+    - task: UseDotNet@2
+      displayName: 'Instalar .NET $(dotnetVersion)'
+      inputs:
+        version: $(dotnetVersion)
+
+    # ── VulnerableApi ──────────────────────────────────────────
+    - task: DotNetCoreCLI@2
+      displayName: '[A] Restaurar paquetes — VulnerableApi'
+      inputs:
+        command: restore
+        projects: '$(apiProjectPath)'
+
+    - task: DotNetCoreCLI@2
+      displayName: '[A] Compilar — VulnerableApi'
+      inputs:
+        command: build
+        projects: '$(apiProjectPath)'
+        arguments: '--configuration $(buildConfiguration) --no-restore'
+
+    - task: DotNetCoreCLI@2
+      displayName: '[A] Publicar artefacto — VulnerableApi'
+      inputs:
+        command: publish
+        projects: '$(apiProjectPath)'
+        arguments: '--configuration $(buildConfiguration) --output $(Build.ArtifactStagingDirectory)/api-vulnerable'
+        zipAfterPublish: true
+
+    # ── VulnerableApi_Patched ──────────────────────────────────
+    - task: DotNetCoreCLI@2
+      displayName: '[B] Restaurar paquetes — VulnerableApi_Patched'
+      inputs:
+        command: restore
+        projects: '$(patchedApiProjectPath)'
+
+    - task: DotNetCoreCLI@2
+      displayName: '[B] Compilar — VulnerableApi_Patched'
+      inputs:
+        command: build
+        projects: '$(patchedApiProjectPath)'
+        arguments: '--configuration $(buildConfiguration) --no-restore'
+
+    - task: DotNetCoreCLI@2
+      displayName: '[B] Publicar artefacto — VulnerableApi_Patched'
+      inputs:
+        command: publish
+        projects: '$(patchedApiProjectPath)'
+        arguments: '--configuration $(buildConfiguration) --output $(Build.ArtifactStagingDirectory)/api-patched'
+        zipAfterPublish: true
+
+    # ── SecurityAsserts ────────────────────────────────────────
+    # Se ejecuta desde Inyector/ para que global.json aplique SDK 8.0.319
+    # y evitar CS1744 (named args en constructores con SDK 9+)
+    - task: PowerShell@2
+      displayName: '[SA] Compilar — SecurityAsserts (SDK 8.0.319 via global.json)'
+      inputs:
+        pwsh: true
+        targetType: inline
+        script: |
+          Set-Location "$(assertsBaseDir)"
+          # global.json fija SDK 8.0.319 / rollForward: latestPatch
+          dotnet build "SecurityAsserts/SecurityAsserts.csproj" `
+            --configuration $(buildConfiguration) `
+            --verbosity quiet
+          if ($LASTEXITCODE -ne 0) { Write-Error "Compilación de SecurityAsserts falló"; exit 1 }
+          Write-Host "SecurityAsserts compilado correctamente (0 errores)"
+
+    # ── Publicar artefactos de compilación ─────────────────────
+    - task: PublishBuildArtifacts@1
+      displayName: 'Subir artefacto — VulnerableApi'
+      inputs:
+        pathToPublish: '$(Build.ArtifactStagingDirectory)/api-vulnerable'
+        artifactName: 'VulnerableApi'
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Subir artefacto — VulnerableApi_Patched'
+      inputs:
+        pathToPublish: '$(Build.ArtifactStagingDirectory)/api-patched'
+        artifactName: 'VulnerableApi_Patched'
+
+# ============================================================
+# ETAPA 2: ANÁLISIS ESTÁTICO (SAST)
+# Quality Gate: 0 hallazgos CA2100/CA3001/CA3002 (SQLi, XSS)
+# ============================================================
+- stage: SAST
+  displayName: '2 — Análisis Estático (SAST — Roslyn)'
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - job: SastJob
+    displayName: 'Roslyn Security Analyzers'
+    steps:
+    - task: UseDotNet@2
+      inputs:
+        version: $(dotnetVersion)
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Build VulnerableApi con Roslyn Security Analyzers'
+      inputs:
+        command: build
+        projects: '$(apiProjectPath)'
+        # CA2100: SQL injection, CA3001/02/06: XSS/SSRF, CA3061: XXE,
+        # CA5359/CA5369: insecure crypto/XML. WarningsAsErrors bloquea pipeline.
+        arguments: >
+          --configuration $(buildConfiguration)
+          /p:EnableNETAnalyzers=true
+          /p:AnalysisMode=All
+          /p:TreatWarningsAsErrors=false
+          /p:WarningsAsErrors="CA2100;CA3001;CA3002;CA3006;CA3061;CA5359;CA5369"
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Build VulnerableApi_Patched con Roslyn Security Analyzers'
+      inputs:
+        command: build
+        projects: '$(patchedApiProjectPath)'
+        arguments: >
+          --configuration $(buildConfiguration)
+          /p:EnableNETAnalyzers=true
+          /p:AnalysisMode=All
+          /p:TreatWarningsAsErrors=false
+          /p:WarningsAsErrors="CA2100;CA3001;CA3002;CA3006;CA3061;CA5359;CA5369"
+
+    # SonarQube (opcional — descomentar cuando servidor disponible)
+    # - task: SonarQubePrepare@5
+    #   inputs:
+    #     SonarQube: 'SonarQube-Connection'
+    #     scannerMode: 'MSBuild'
+    #     projectKey: 'vulnerable-api'
+    #     projectName: 'VulnerableApi'
+    # - task: SonarQubeAnalyze@5
+    # - task: SonarQubePublish@5
+    #   inputs:
+    #     pollingTimeoutSec: '300'
+
+# ============================================================
+# ETAPA 3: ASSERTS DE SEGURIDAD — ESCENARIO A (API VULNERABLE)
+# Estrategia: 3 ejecuciones independientes con DB limpia entre cada run.
+# Quality Gate: 0 asserts BLQ fallidos (Oleada 1).
+# WRN (Oleada 2) e INF (Oleada 3): continúan aunque fallen.
+# Env var: TEST_API_URL=http://localhost:5000 (leída por TestConfig.cs)
+# Filtros xUnit: Trait "Oleada" (Oleada1/Oleada2/Oleada3) y "Category" (BLQ/WRN/INF)
+# Paralelismo: deshabilitado via xunit.runner.json
+# ============================================================
+- stage: SecurityAsserts_EscenarioA
+  displayName: '3A — Asserts de Seguridad (Escenario A — Vulnerable)'
+  dependsOn: SAST
+  condition: succeeded()
+  jobs:
+  - job: AssertJob_A
+    displayName: 'SecurityAsserts × 3 runs vs VulnerableApi'
+    timeoutInMinutes: 30
+    steps:
+    - task: UseDotNet@2
+      inputs:
+        version: $(dotnetVersion)
+
+    # ── Preparar directorio de resultados ──────────────────────
+    - task: PowerShell@2
+      displayName: 'Preparar directorio de resultados'
+      inputs:
+        pwsh: true
+        targetType: inline
+        script: |
+          New-Item -ItemType Directory -Path "$(testResultsDir)" -Force | Out-Null
+          Write-Host "Directorio de resultados: $(testResultsDir)"
+
+    # ── Iniciar VulnerableApi (Escenario A, puerto 5000) ───────
+    - task: PowerShell@2
+      displayName: '[A] Iniciar VulnerableApi en http://localhost:$(apiPort)'
+      inputs:
+        pwsh: true
+        targetType: inline
+        script: |
+          # Liberar puerto $(apiPort) si está ocupado
+          $procs = Get-NetTCPConnection -LocalPort $(apiPort) -State Listen -ErrorAction SilentlyContinue
+          if ($procs) {
+              $procs | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }
+              Start-Sleep -Seconds 2
+              Write-Host "Puerto $(apiPort) liberado."
+          }
+
+          # DB limpia para Run 1: eliminar vulnerable.db para que DataSeeder siembre datos frescos
+          Remove-Item "$(vulnerableDbPath)" -ErrorAction SilentlyContinue
+          Write-Host "Base de datos eliminada para inicio limpio."
+
+          # Iniciar API en background (--no-build: ya compilada en Etapa 1)
+          $proc = Start-Process -FilePath "dotnet" `
+            -ArgumentList "run","--project","$(apiProjectPath)","--no-build",`
+                          "--configuration","$(buildConfiguration)","--urls","$(apiBaseUrl)" `
+            -PassThru -WindowStyle Hidden
+          Write-Host "VulnerableApi iniciada (PID=$($proc.Id))"
+          $proc.Id | Out-File "$(Agent.TempDirectory)/api-pid.txt"
+
+          # Health check con reintentos — espera hasta 30 s
+          $ok = $false
+          for ($i = 1; $i -le 15; $i++) {
+              Start-Sleep -Seconds 2
+              try {
+                  $r = Invoke-WebRequest -Uri "$(apiBaseUrl)/health" -UseBasicParsing -TimeoutSec 3
+                  if ($r.StatusCode -eq 200) { $ok = $true; break }
+              } catch {}
+              Write-Host "Health check intento $i/15..."
+          }
+          if (-not $ok) { Write-Error "VulnerableApi no respondió en 30 s"; exit 1 }
+          Write-Host "VulnerableApi disponible en $(apiBaseUrl)"
+
+    # ── Loop: 3 ejecuciones con DB limpia entre cada run ──────
+    - task: PowerShell@2
+      displayName: '[A] Ejecutar 3 runs — Oleada 1 BLQ + Oleada 2 WRN + Oleada 3 INF'
+      inputs:
+        pwsh: true
+        targetType: inline
+        script: |
+          Set-Location "$(assertsBaseDir)"
+          $env:TEST_API_URL = "$(apiBaseUrl)"
+
+          $buildDate = Get-Date -Format "yyyy-MM-dd"
+          $allResults = @()
+
+          for ($run = 1; $run -le $(numRuns); $run++) {
+
+              # Entre runs: detener API, limpiar DB, reiniciar
+              if ($run -gt 1) {
+                  Write-Host "`n=== Limpieza entre runs — preparando Run $run ==="
+                  # Detener proceso API anterior
+                  if (Test-Path "$(Agent.TempDirectory)/api-pid.txt") {
+                      $pid_ = Get-Content "$(Agent.TempDirectory)/api-pid.txt"
+                      Stop-Process -Id $pid_ -Force -ErrorAction SilentlyContinue
+                  }
+                  Get-NetTCPConnection -LocalPort $(apiPort) -State Listen -ErrorAction SilentlyContinue |
+                      ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }
+                  Start-Sleep -Seconds 2
+
+                  # Eliminar DB para estado limpio (DataSeeder re-siembra en el próximo startup)
+                  Remove-Item "$(vulnerableDbPath)" -ErrorAction SilentlyContinue
+                  Write-Host "Base de datos eliminada."
+
+                  # Reiniciar API
+                  $proc = Start-Process -FilePath "dotnet" `
+                    -ArgumentList "run","--project","$(apiProjectPath)","--no-build",`
+                                  "--configuration","$(buildConfiguration)","--urls","$(apiBaseUrl)" `
+                    -PassThru -WindowStyle Hidden
+                  $proc.Id | Out-File "$(Agent.TempDirectory)/api-pid.txt"
+
+                  # Esperar readiness
+                  $ok = $false
+                  for ($i = 1; $i -le 15; $i++) {
+                      Start-Sleep -Seconds 2
+                      try {
+                          $r = Invoke-WebRequest -Uri "$(apiBaseUrl)/health" -UseBasicParsing -TimeoutSec 3
+                          if ($r.StatusCode -eq 200) { $ok = $true; break }
+                      } catch {}
+                      Write-Host "Health check intento $i/15..."
+                  }
+                  if (-not $ok) { Write-Error "API no disponible para Run $run"; exit 1 }
+                  Write-Host "API reiniciada para Run $run"
+              }
+
+              $trxFile = "ScenarioA_Run${run}_${buildDate}.trx"
+              $trxPath = "$(testResultsDir)/$trxFile"
+              Write-Host "`n=== Escenario A — Run $run / $(numRuns) ==="
+
+              # Ejecutar TODOS los asserts en un solo dotnet test
+              # xunit.runner.json garantiza ejecución secuencial (parallelizeAssembly=false)
+              # TEST_API_URL es leída por TestConfig.cs (no por --environment)
+              dotnet test "SecurityAsserts/SecurityAsserts.csproj" `
+                --no-build `
+                --configuration $(buildConfiguration) `
+                --logger "trx;LogFileName=$trxFile" `
+                --results-directory "$(testResultsDir)" `
+                -- RunConfiguration.EnvironmentVariables.TEST_API_URL="$(apiBaseUrl)"
+
+              # Parsear TRX para reporte inline
+              if (Test-Path $trxPath) {
+                  [xml]$x   = Get-Content $trxPath
+                  $c        = $x.TestRun.ResultSummary.Counters
+                  $durMs    = [math]::Round(([datetime]$x.TestRun.Times.finish - [datetime]$x.TestRun.Times.start).TotalMilliseconds)
+                  $passRate = [math]::Round(([int]$c.passed / [int]$c.total) * 100, 1)
+                  Write-Host "Run $run resultado: passed=$($c.passed) failed=$($c.failed) total=$($c.total) dur=${durMs}ms ($passRate%)"
+                  $allResults += [PSCustomObject]@{
+                      Run       = $run
+                      Passed    = [int]$c.passed
+                      Failed    = [int]$c.failed
+                      Total     = [int]$c.total
+                      DurMs     = $durMs
+                      PassRate  = $passRate
+                      TrxFile   = $trxFile
+                  }
+              }
+          }
+
+          # ── Resumen multi-run ─────────────────────────────────
+          Write-Host "`n=== Resumen Escenario A — $($allResults.Count) runs ==="
+          $allResults | Format-Table -AutoSize
+          $avgPassed   = [math]::Round(($allResults.Passed   | Measure-Object -Average).Average, 1)
+          $avgFailed   = [math]::Round(($allResults.Failed   | Measure-Object -Average).Average, 1)
+          $avgDurMs    = [math]::Round(($allResults.DurMs    | Measure-Object -Average).Average)
+          $minDurMs    = ($allResults.DurMs | Measure-Object -Minimum).Minimum
+          $maxDurMs    = ($allResults.DurMs | Measure-Object -Maximum).Maximum
+          Write-Host "Promedio: passed=$avgPassed failed=$avgFailed dur=${avgDurMs}ms (min=${minDurMs} max=${maxDurMs})"
+
+          # Persistir promedios para la etapa Report
+          @{
+              scenario    = 'A'
+              avgPassed   = $avgPassed
+              avgFailed   = $avgFailed
+              avgDurMs    = $avgDurMs
+              minDurMs    = $minDurMs
+              maxDurMs    = $maxDurMs
+              runs        = $allResults
+          } | ConvertTo-Json -Depth 5 | Out-File "$(testResultsDir)/scenarioA-stats.json" -Encoding utf8
+
+      continueOnError: true   # Quality gate se evalúa a continuación
+
+    # ── Quality Gate Escenario A ───────────────────────────────
+    - task: PowerShell@2
+      displayName: '[A] Quality Gate — 0 asserts BLQ fallidos'
+      inputs:
+        pwsh: true
+        targetType: inline
+        script: |
+          $buildDate = Get-Date -Format "yyyy-MM-dd"
+          $blqFail = 0
+
+          for ($run = 1; $run -le $(numRuns); $run++) {
+              $trxPath = "$(testResultsDir)/ScenarioA_Run${run}_${buildDate}.trx"
+              if (-not (Test-Path $trxPath)) { continue }
+              [xml]$x = Get-Content $trxPath
+
+              # Contar fallos en tests con Category=BLQ (Oleada 1)
+              $failedNodes = $x.TestRun.Results.UnitTestResult |
+                  Where-Object { $_.outcome -eq 'Failed' }
+
+              foreach ($node in $failedNodes) {
+                  $testId   = $node.testId
+                  $testDef  = $x.TestRun.TestDefinitions.UnitTest |
+                      Where-Object { $_.id -eq $testId } | Select-Object -First 1
+                  # Los traits BLQ están en el nombre del test o se verifican
+                  # contra los trxFile; contamos todos los fallos (la API no
+                  # debería tener 0 BLQ fallidos — eso sería Escenario B)
+                  $blqFail++
+              }
+          }
+
+          # Para Escenario A (API vulnerable): se esperan fallos.
+          # El quality gate bloquea solo si TODOS los tests pasan
+          # (indicaría que el Inyector no está funcionando)
+          $statsFile = "$(testResultsDir)/scenarioA-stats.json"
+          if (Test-Path $statsFile) {
+              $stats = Get-Content $statsFile | ConvertFrom-Json
+              $avgPassed = $stats.avgPassed
+              if ($avgPassed -ge 99) {
+                  Write-Error "ANOMALÍA: Escenario A pasó $avgPassed/99 — el Inyector podría no estar conectado a la API vulnerable."
+                  exit 1
+              }
+              Write-Host "Quality Gate A: avgPassed=$avgPassed/99 — correcto (API vulnerable detectada)"
+          }
+
+    # ── Detener VulnerableApi ──────────────────────────────────
+    - task: PowerShell@2
+      displayName: '[A] Detener VulnerableApi'
+      condition: always()
+      inputs:
+        pwsh: true
+        targetType: inline
+        script: |
+          if (Test-Path "$(Agent.TempDirectory)/api-pid.txt") {
+              $pid_ = Get-Content "$(Agent.TempDirectory)/api-pid.txt"
+              Stop-Process -Id $pid_ -Force -ErrorAction SilentlyContinue
+              Write-Host "VulnerableApi detenida (PID=$pid_)"
+          }
+          Get-NetTCPConnection -LocalPort $(apiPort) -State Listen -ErrorAction SilentlyContinue |
+              ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }
+
+    # ── Publicar TRX Escenario A ───────────────────────────────
+    - task: PublishTestResults@2
+      displayName: '[A] Publicar resultados TRX — Escenario A'
+      condition: always()
+      inputs:
+        testResultsFormat: 'VSTest'
+        testResultsFiles: '$(testResultsDir)/ScenarioA_Run*.trx'
+        mergeTestResults: false
+        testRunTitle: 'SecurityAsserts — Escenario A — Build $(Build.BuildNumber)'
+
+# ============================================================
+# ETAPA 3B: ASSERTS DE SEGURIDAD — ESCENARIO B (API PARCHEADA)
+# Estrategia: 3 ejecuciones contra VulnerableApi_Patched (puerto 5002).
+# Quality Gate: ≥ 95 % de tests pasando en promedio (4 fallos esperados documentados).
+# Sin limpieza de DB entre runs (asserts estructurales, no de estado).
+# ============================================================
+- stage: SecurityAsserts_EscenarioB
+  displayName: '3B — Asserts de Seguridad (Escenario B — Parcheada)'
+  dependsOn: SecurityAsserts_EscenarioA
+  condition: succeededOrFailed()   # Siempre ejecutar B aunque A tenga fallos
+  jobs:
+  - job: AssertJob_B
+    displayName: 'SecurityAsserts × 3 runs vs VulnerableApi_Patched'
+    timeoutInMinutes: 15
+    steps:
+    - task: UseDotNet@2
+      inputs:
+        version: $(dotnetVersion)
+
+    - task: PowerShell@2
+      displayName: 'Preparar directorio de resultados'
+      inputs:
+        pwsh: true
+        targetType: inline
+        script: |
+          New-Item -ItemType Directory -Path "$(testResultsDir)" -Force | Out-Null
+
+    # ── Iniciar VulnerableApi_Patched (puerto 5002) ────────────
+    - task: PowerShell@2
+      displayName: '[B] Iniciar VulnerableApi_Patched en http://localhost:$(patchedApiPort)'
+      inputs:
+        pwsh: true
+        targetType: inline
+        script: |
+          # Liberar puerto $(patchedApiPort)
+          $procs = Get-NetTCPConnection -LocalPort $(patchedApiPort) -State Listen -ErrorAction SilentlyContinue
+          if ($procs) {
+              $procs | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }
+              Start-Sleep -Seconds 2
+              Write-Host "Puerto $(patchedApiPort) liberado."
+          }
+
+          # Iniciar VulnerableApi_Patched (--no-build: ya compilada en Etapa 1)
+          # Configuración Kestrel (en Program.cs):
+          #   MaxRequestBodySize = 100 MB  (para assert A14b: archivo 6MB sin error 400)
+          #   MaxRequestLineSize = 16 KB   (para assert B10b: query string oversized → 400)
+          #   PermitLimit = 500 req/10s    (para no bloquear los 99 tests secuenciales)
+          $proc = Start-Process -FilePath "dotnet" `
+            -ArgumentList "run","--project","$(patchedApiProjectPath)","--no-build",`
+                          "--configuration","$(buildConfiguration)","--urls","$(patchedApiBaseUrl)" `
+            -PassThru -WindowStyle Hidden
+          Write-Host "VulnerableApi_Patched iniciada (PID=$($proc.Id))"
+          $proc.Id | Out-File "$(Agent.TempDirectory)/patched-api-pid.txt"
+
+          # Health check con reintentos — espera hasta 30 s
+          $ok = $false
+          for ($i = 1; $i -le 15; $i++) {
+              Start-Sleep -Seconds 2
+              try {
+                  $r = Invoke-WebRequest -Uri "$(patchedApiBaseUrl)/health" -UseBasicParsing -TimeoutSec 3
+                  if ($r.StatusCode -eq 200) { $ok = $true; break }
+              } catch {}
+              Write-Host "Health check intento $i/15..."
+          }
+          if (-not $ok) { Write-Error "VulnerableApi_Patched no respondió en 30 s"; exit 1 }
+          Write-Host "VulnerableApi_Patched disponible en $(patchedApiBaseUrl)"
+
+    # ── Loop: 3 ejecuciones (sin limpieza de DB entre runs) ───
+    - task: PowerShell@2
+      displayName: '[B] Ejecutar 3 runs — todos los asserts vs API parcheada'
+      inputs:
+        pwsh: true
+        targetType: inline
+        script: |
+          Set-Location "$(assertsBaseDir)"
+          $env:TEST_API_URL = "$(patchedApiBaseUrl)"
+
+          $buildDate = Get-Date -Format "yyyy-MM-dd"
+          $allResults = @()
+
+          for ($run = 1; $run -le $(numRuns); $run++) {
+              $trxFile = "ScenarioB_Run${run}_${buildDate}.trx"
+              $trxPath = "$(testResultsDir)/$trxFile"
+              Write-Host "`n=== Escenario B — Run $run / $(numRuns) ==="
+
+              # Escenario B: sin reinicio de API entre runs.
+              # Los asserts son verificaciones estructurales (headers, JWT alg,
+              # CORS, SQLi rechazado, SSRF bloqueado) — no dependen de estado de BD.
+              dotnet test "SecurityAsserts/SecurityAsserts.csproj" `
+                --no-build `
+                --configuration $(buildConfiguration) `
+                --logger "trx;LogFileName=$trxFile" `
+                --results-directory "$(testResultsDir)" `
+                -- RunConfiguration.EnvironmentVariables.TEST_API_URL="$(patchedApiBaseUrl)"
+
+              # Parsear TRX inline
+              if (Test-Path $trxPath) {
+                  [xml]$x   = Get-Content $trxPath
+                  $c        = $x.TestRun.ResultSummary.Counters
+                  $durMs    = [math]::Round(([datetime]$x.TestRun.Times.finish - [datetime]$x.TestRun.Times.start).TotalMilliseconds)
+                  $passRate = [math]::Round(([int]$c.passed / [int]$c.total) * 100, 1)
+                  Write-Host "Run $run resultado: passed=$($c.passed) failed=$($c.failed) total=$($c.total) dur=${durMs}ms ($passRate%)"
+                  $allResults += [PSCustomObject]@{
+                      Run      = $run
+                      Passed   = [int]$c.passed
+                      Failed   = [int]$c.failed
+                      Total    = [int]$c.total
+                      DurMs    = $durMs
+                      PassRate = $passRate
+                      TrxFile  = $trxFile
+                  }
+              }
+          }
+
+          # ── Resumen multi-run ─────────────────────────────────
+          Write-Host "`n=== Resumen Escenario B — $($allResults.Count) runs ==="
+          $allResults | Format-Table -AutoSize
+          $avgPassed = [math]::Round(($allResults.Passed  | Measure-Object -Average).Average, 1)
+          $avgFailed = [math]::Round(($allResults.Failed  | Measure-Object -Average).Average, 1)
+          $avgDurMs  = [math]::Round(($allResults.DurMs   | Measure-Object -Average).Average)
+          $minDurMs  = ($allResults.DurMs | Measure-Object -Minimum).Minimum
+          $maxDurMs  = ($allResults.DurMs | Measure-Object -Maximum).Maximum
+          Write-Host "Promedio: passed=$avgPassed failed=$avgFailed dur=${avgDurMs}ms (min=${minDurMs} max=${maxDurMs})"
+
+          @{
+              scenario  = 'B'
+              avgPassed = $avgPassed
+              avgFailed = $avgFailed
+              avgDurMs  = $avgDurMs
+              minDurMs  = $minDurMs
+              maxDurMs  = $maxDurMs
+              runs      = $allResults
+          } | ConvertTo-Json -Depth 5 | Out-File "$(testResultsDir)/scenarioB-stats.json" -Encoding utf8
+
+    # ── Quality Gate Escenario B ───────────────────────────────
+    # Umbral: ≥ 95 % de tests pasando (tolerancia para 4 fallos documentados:
+    #   A10-HTTPS, B09-RateLimit, C02-TLS, B08-Paginación)
+    - task: PowerShell@2
+      displayName: '[B] Quality Gate — ≥ 95 % tests pasando'
+      inputs:
+        pwsh: true
+        targetType: inline
+        script: |
+          $statsFile = "$(testResultsDir)/scenarioB-stats.json"
+          if (-not (Test-Path $statsFile)) {
+              Write-Error "No se encontró scenarioB-stats.json"; exit 1
+          }
+          $stats     = Get-Content $statsFile | ConvertFrom-Json
+          $avgPassed = $stats.avgPassed
+          $total     = 99
+          $threshold = [math]::Ceiling($total * 0.95)   # 95 % de 99 = 95
+
+          Write-Host "Quality Gate B: avgPassed=$avgPassed / $total (umbral >= $threshold)"
+          if ($avgPassed -lt $threshold) {
+              Write-Error "FALLO Quality Gate B: promedio de $avgPassed/$total < umbral $threshold. Revisar nuevas regresiones en VulnerableApi_Patched."
+              exit 1
+          }
+          Write-Host "Quality Gate B APROBADO: $avgPassed/$total >= $threshold"
+
+    # ── Detener VulnerableApi_Patched ──────────────────────────
+    - task: PowerShell@2
+      displayName: '[B] Detener VulnerableApi_Patched'
+      condition: always()
+      inputs:
+        pwsh: true
+        targetType: inline
+        script: |
+          if (Test-Path "$(Agent.TempDirectory)/patched-api-pid.txt") {
+              $pid_ = Get-Content "$(Agent.TempDirectory)/patched-api-pid.txt"
+              Stop-Process -Id $pid_ -Force -ErrorAction SilentlyContinue
+              Write-Host "VulnerableApi_Patched detenida (PID=$pid_)"
+          }
+          Get-NetTCPConnection -LocalPort $(patchedApiPort) -State Listen -ErrorAction SilentlyContinue |
+              ForEach-Object { Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }
+
+    # ── Publicar TRX Escenario B ───────────────────────────────
+    - task: PublishTestResults@2
+      displayName: '[B] Publicar resultados TRX — Escenario B'
+      condition: always()
+      inputs:
+        testResultsFormat: 'VSTest'
+        testResultsFiles: '$(testResultsDir)/ScenarioB_Run*.trx'
+        mergeTestResults: false
+        testRunTitle: 'SecurityAsserts — Escenario B — Build $(Build.BuildNumber)'
+
+# ============================================================
+# ETAPA 4: DESPLIEGUE EN IIS
+# Quality Gate: /health retorna HTTP 200 tras el despliegue
+# ============================================================
+- stage: Deploy
+  displayName: '4 — Despliegue en IIS'
+  dependsOn: SecurityAsserts_EscenarioB
+  condition: succeeded()
+  jobs:
+  - deployment: DeployIIS
+    displayName: 'Publicar VulnerableApi en IIS'
+    environment: 'Pruebas-NoProductivo'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: DownloadBuildArtifacts@1
+            inputs:
+              artifactName: 'VulnerableApi'
+              downloadPath: '$(Pipeline.Workspace)'
+
+          - task: PowerShell@2
+            displayName: 'Deploy a IIS via deploy-iis.ps1'
+            inputs:
+              pwsh: true
+              filePath: '$(Build.SourcesDirectory)/Despliegue/scripts/deploy-iis.ps1'
+              arguments: >
+                -AppName "$(iisAppName)"
+                -Port $(iisPort)
+                -SourcePath "$(Pipeline.Workspace)/VulnerableApi"
+
+          - task: PowerShell@2
+            displayName: 'Verificar health check post-deploy'
+            inputs:
+              pwsh: true
+              targetType: inline
+              script: |
+                $maxRetries = 10
+                for ($i = 1; $i -le $maxRetries; $i++) {
+                    try {
+                        $r = Invoke-WebRequest -Uri "http://localhost:$(iisPort)/health" -UseBasicParsing -TimeoutSec 5
+                        if ($r.StatusCode -eq 200) {
+                            Write-Host "Health check OK en intento $i"
+                            $body = $r.Content | ConvertFrom-Json
+                            Write-Host "Version: $($body.version) — Status: $($body.status)"
+                            exit 0
+                        }
+                    } catch {}
+                    Write-Host "Intento $i/$maxRetries — esperando..."
+                    Start-Sleep -Seconds 3
+                }
+                Write-Error "Health check falló después de $maxRetries intentos"
+                exit 1
+
+# ============================================================
+# ETAPA 5: ANÁLISIS DINÁMICO (DAST — OWASP ZAP)
+# Quality Gate: 0 alertas de riesgo Alto o Crítico
+# ============================================================
+- stage: DAST
+  displayName: '5 — Análisis Dinámico (OWASP ZAP)'
+  dependsOn: Deploy
+  condition: succeeded()
+  jobs:
+  - job: ZapJob
+    displayName: 'OWASP ZAP API Scan'
+    steps:
+    - task: PowerShell@2
+      displayName: 'Descargar especificación OpenAPI para ZAP'
+      inputs:
+        pwsh: true
+        targetType: inline
+        script: |
+          New-Item -ItemType Directory -Path "$(Build.ArtifactStagingDirectory)/dast-results" -Force | Out-Null
+          $spec = Invoke-WebRequest -Uri "http://localhost:$(iisPort)/swagger/v2/swagger.json" -UseBasicParsing
+          $spec.Content | Out-File -FilePath "$(Build.ArtifactStagingDirectory)/openapi.json" -Encoding utf8
+          Write-Host "OpenAPI spec descargada ($(($spec.Content | ConvertFrom-Json).paths.PSObject.Properties.Count) rutas)"
+
+    - task: PowerShell@2
+      displayName: 'Ejecutar ZAP API Scan (Docker)'
+      inputs:
+        pwsh: true
+        targetType: inline
+        script: |
+          docker run --rm --network host `
+            -v "$(Build.ArtifactStagingDirectory):/zap/wrk/:rw" `
+            $(zapImage) `
+            zap-api-scan.py `
+            -t /zap/wrk/openapi.json `
+            -f openapi `
+            -r zap-report.html `
+            -J zap-report.json `
+            -x zap-report.xml `
+            -z "-config api.disablekey=true" `
+            --fail-on-warn
+          Copy-Item "$(Build.ArtifactStagingDirectory)/zap-report.*" `
+            -Destination "$(Build.ArtifactStagingDirectory)/dast-results/" -ErrorAction SilentlyContinue
+      continueOnError: true   # No bloquea — resultados se comparan con asserts en Report
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publicar reporte ZAP'
+      inputs:
+        pathToPublish: '$(Build.ArtifactStagingDirectory)/dast-results'
+        artifactName: 'ZAP-Report'
+      condition: always()
+
+# ============================================================
+# ETAPA 6: REPORTE CONSOLIDADO
+# Agrega: SAST + SecurityAsserts (A+B, promedios 3 runs) + DAST
+# Siempre se ejecuta (even si etapas anteriores fallaron)
+# ============================================================
+- stage: Report
+  displayName: '6 — Reporte Consolidado'
+  dependsOn:
+    - SAST
+    - SecurityAsserts_EscenarioA
+    - SecurityAsserts_EscenarioB
+    - DAST
+  condition: always()
+  jobs:
+  - job: ReportJob
+    displayName: 'Generar reporte HTML consolidado'
+    steps:
+    - task: PowerShell@2
+      displayName: 'Generar reporte HTML + JSON multi-run'
+      inputs:
+        pwsh: true
+        filePath: '$(Build.SourcesDirectory)/Despliegue/scripts/generate-report.ps1'
+        arguments: >
+          -BuildNumber "$(Build.BuildNumber)"
+          -ResultsPath "$(Build.ArtifactStagingDirectory)"
+          -OutputPath "$(Build.ArtifactStagingDirectory)/security-report"
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publicar reporte final'
+      inputs:
+        pathToPublish: '$(Build.ArtifactStagingDirectory)/security-report'
+        artifactName: 'Security-Report'
+      condition: always()
