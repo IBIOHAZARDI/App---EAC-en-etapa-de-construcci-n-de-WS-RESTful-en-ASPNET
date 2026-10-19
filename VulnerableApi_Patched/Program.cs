@@ -73,8 +73,17 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
 builder.Services.AddAuthorization();
 
 // FIX G1-V2 (A03): Rate limiting nativo .NET 8 — 5 req/10 s por IP en /auth/login
-// FIX G4-V1: Redirige HTTP→HTTPS al puerto 5003
-builder.Services.AddHttpsRedirection(opt => opt.HttpsPort = 5003);
+// FIX G4-V1: Redirige HTTP (5003) → HTTPS (5002) y envía HSTS (también en localhost, que .NET excluye por defecto)
+builder.Services.AddHttpsRedirection(opt =>
+{
+    opt.RedirectStatusCode = StatusCodes.Status307TemporaryRedirect;
+    opt.HttpsPort = 5002;
+});
+builder.Services.AddHsts(opt =>
+{
+    opt.MaxAge = TimeSpan.FromDays(365);
+    opt.ExcludedHosts.Clear();
+});
 builder.Services.AddRateLimiter(rl =>
 {
     rl.AddFixedWindowLimiter("login", opt =>
@@ -114,11 +123,10 @@ app.Use(async (ctx, next) =>
 app.UseExceptionHandler("/error");
 app.Map("/error", () => Results.Problem("An unexpected error occurred.", statusCode: 500));
 
-// FIX G4-V1 (PRODUCCIÓN): HTTPS redirect y HSTS — activo en IIS/nginx con binding SSL.
-// En el ambiente de test (HTTP local) se omiten para no romper las llamadas del cliente de test.
-// Para verificar A10 en producción: desplegar con app.UseHttpsRedirection() y app.UseHsts().
-// app.UseHttpsRedirection();
-// app.UseHsts();
+// FIX G4-V1: HTTPS redirect y HSTS activos. El laboratorio escucha en https://localhost:5002
+// (certificado de desarrollo de ASP.NET Core) y http://localhost:5003 (solo redirige).
+app.UseHsts();
+app.UseHttpsRedirection();
 
 // FIX G2-V2: Middleware de cabeceras de seguridad
 app.Use(async (ctx, next) =>

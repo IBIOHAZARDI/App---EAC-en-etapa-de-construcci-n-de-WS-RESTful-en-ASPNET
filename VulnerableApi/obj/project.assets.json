@@ -3260,23 +3260,23 @@
     ]
   },
   "packageFolders": {
-    "C:\\Users\\julia\\.nuget\\packages\\": {},
+    "C:\\Users\\userRun\\.nuget\\packages\\": {},
     "C:\\Program Files (x86)\\Microsoft Visual Studio\\Shared\\NuGetPackages": {}
   },
   "project": {
     "version": "1.0.0",
     "restore": {
-      "projectUniqueName": "c:\\Trabajo\\Universidad\\Desarrollo\\App---EAC-en-etapa-de-construcci-n-de-WS-RESTful-en-ASPNET\\VulnerableApi\\VulnerableApi.csproj",
+      "projectUniqueName": "C:\\Trabajo\\Universidad\\Desarrollo\\App---EAC-en-etapa-de-construcci-n-de-WS-RESTful-en-ASPNET\\VulnerableApi\\VulnerableApi.csproj",
       "projectName": "VulnerableApi",
-      "projectPath": "c:\\Trabajo\\Universidad\\Desarrollo\\App---EAC-en-etapa-de-construcci-n-de-WS-RESTful-en-ASPNET\\VulnerableApi\\VulnerableApi.csproj",
-      "packagesPath": "C:\\Users\\julia\\.nuget\\packages\\",
-      "outputPath": "c:\\Trabajo\\Universidad\\Desarrollo\\App---EAC-en-etapa-de-construcci-n-de-WS-RESTful-en-ASPNET\\VulnerableApi\\obj\\",
+      "projectPath": "C:\\Trabajo\\Universidad\\Desarrollo\\App---EAC-en-etapa-de-construcci-n-de-WS-RESTful-en-ASPNET\\VulnerableApi\\VulnerableApi.csproj",
+      "packagesPath": "C:\\Users\\userRun\\.nuget\\packages\\",
+      "outputPath": "C:\\Trabajo\\Universidad\\Desarrollo\\App---EAC-en-etapa-de-construcci-n-de-WS-RESTful-en-ASPNET\\VulnerableApi\\obj\\",
       "projectStyle": "PackageReference",
       "fallbackFolders": [
         "C:\\Program Files (x86)\\Microsoft Visual Studio\\Shared\\NuGetPackages"
       ],
       "configFilePaths": [
-        "C:\\Users\\julia\\AppData\\Roaming\\NuGet\\NuGet.Config",
+        "C:\\Users\\userRun\\AppData\\Roaming\\NuGet\\NuGet.Config",
         "C:\\Program Files (x86)\\NuGet\\Config\\Microsoft.VisualStudio.FallbackLocation.config",
         "C:\\Program Files (x86)\\NuGet\\Config\\Microsoft.VisualStudio.Offline.config"
       ],
@@ -3302,8 +3302,7 @@
         "enableAudit": "true",
         "auditLevel": "low",
         "auditMode": "direct"
-      },
-      "SdkAnalysisLevel": "9.0.300"
+      }
     },
     "frameworks": {
       "net8.0": {
@@ -3347,7 +3346,7 @@
             "privateAssets": "all"
           }
         },
-        "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\9.0.316/PortableRuntimeIdentifierGraph.json"
+        "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\8.0.319/PortableRuntimeIdentifierGraph.json"
       }
     }
   }

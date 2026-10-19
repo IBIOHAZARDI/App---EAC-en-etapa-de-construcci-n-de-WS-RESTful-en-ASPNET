@@ -1,1 +1,11 @@
-{"Version":1,"Hash":"HCL0MGhx4iuXVwHNECAIPCUIBBywABlRZCWdweNz4hk=","Source":"VulnerableApi","BasePath":"_content/VulnerableApi","Mode":"Default","ManifestType":"Build","ReferencedProjectsConfiguration":[],"DiscoveryPatterns":[],"Assets":[],"Endpoints":[]}
+{
+  "Version": 1,
+  "Hash": "ZgwmalhKY9g75AFpUKo85xDWmPxoBXIEKVlTR/BPbwk=",
+  "Source": "VulnerableApi",
+  "BasePath": "_content/VulnerableApi",
+  "Mode": "Default",
+  "ManifestType": "Build",
+  "ReferencedProjectsConfiguration": [],
+  "DiscoveryPatterns": [],
+  "Assets": []
+}
