@@ -1,0 +1,107 @@
+# Pipeline de despliegue — Build + Deploy en IIS (agente Windows self-hosted)
+# Requisitos del agente: Windows, IIS + ASP.NET Core Hosting Bundle 8, módulo WebAdministration.
+
+trigger:
+  branches:
+    include:
+      - main
+
+pr: none
+
+variables:
+  buildConfiguration: 'Release'
+  dotnetVersion: '8.x'
+  apiProjectPath: '$(Build.SourcesDirectory)/VulnerableApi/VulnerableApi.csproj'
+  iisAppName: 'VulnerableApi'
+  iisPort: '5000'
+
+pool:
+  name: 'Default'
+  demands:
+    - agent.os -equals Windows_NT
+
+stages:
+- stage: Build
+  displayName: '1 — Compilación y publicación'
+  jobs:
+  - job: BuildJob
+    displayName: 'dotnet publish'
+    steps:
+    - task: UseDotNet@2
+      displayName: 'Instalar .NET SDK $(dotnetVersion)'
+      inputs:
+        packageType: sdk
+        version: $(dotnetVersion)
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Restaurar'
+      inputs:
+        command: restore
+        projects: '$(apiProjectPath)'
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Compilar'
+      inputs:
+        command: build
+        projects: '$(apiProjectPath)'
+        arguments: '--configuration $(buildConfiguration) --no-restore'
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Publicar'
+      inputs:
+        command: publish
+        publishWebProjects: false
+        projects: '$(apiProjectPath)'
+        arguments: '--configuration $(buildConfiguration) --no-build --output $(Build.ArtifactStagingDirectory)/api'
+        zipAfterPublish: true
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Subir artefacto'
+      inputs:
+        pathToPublish: '$(Build.ArtifactStagingDirectory)/api'
+        artifactName: 'VulnerableApi'
+
+- stage: Deploy
+  displayName: '2 — Despliegue en IIS'
+  dependsOn: Build
+  condition: succeeded()
+  jobs:
+  - deployment: DeployIIS
+    displayName: 'Publicar en IIS'
+    environment: 'Pruebas-NoProductivo'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+
+          - task: DownloadBuildArtifacts@1
+            displayName: 'Descargar artefacto'
+            inputs:
+              buildType: current
+              artifactName: 'VulnerableApi'
+              downloadPath: '$(Pipeline.Workspace)'
+
+          - task: PowerShell@2
+            displayName: 'Desplegar con deploy-iis.ps1'
+            inputs:
+              pwsh: false
+              filePath: '$(Build.SourcesDirectory)/Despliegue/scripts/deploy-iis.ps1'
+              arguments: '-AppName "$(iisAppName)" -Port $(iisPort) -SourcePath "$(Pipeline.Workspace)/VulnerableApi"'
+
+          - task: PowerShell@2
+            displayName: 'Health check post-despliegue'
+            inputs:
+              pwsh: false
+              targetType: inline
+              script: |
+                for ($i = 1; $i -le 10; $i++) {
+                    try {
+                        $r = Invoke-WebRequest -Uri "http://localhost:$(iisPort)/health" -UseBasicParsing -TimeoutSec 5
+                        if ($r.StatusCode -eq 200) { Write-Host "Health OK (intento $i): $($r.Content)"; exit 0 }
+                    } catch {}
+                    Write-Host "Intento $i/10 — esperando..."
+                    Start-Sleep -Seconds 3
+                }
+                Write-Error "Health check falló"
+                exit 1
