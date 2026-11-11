@@ -82,8 +82,8 @@ public class AuthController : ControllerBase
 
     private static string GenerateToken(int userId, string role)
     {
-        // G1-V4 VULNERABLE: clave débil ("weak-key"), sin issuer/audience, sin expiración
-        var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes("weak-key"));
+        // G1-V4 VULNERABLE: clave pública y predecible, sin issuer/audience ni expiración
+        var key = new SymmetricSecurityKey(Encoding.UTF8.GetBytes(LabJwtSettings.SigningKey));
         var creds = new SigningCredentials(key, SecurityAlgorithms.HmacSha256);
 
         var claims = new[]

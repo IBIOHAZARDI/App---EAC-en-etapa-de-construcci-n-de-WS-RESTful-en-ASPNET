@@ -34,8 +34,8 @@ builder.Services.AddCors(options =>
 });
 
 // G1-V4 VULNERABLE: JWT sin validación de issuer, audience ni lifetime
-// Clave criptográficamente débil ("weak-key" = 8 bytes)
-// FIX: validar issuer/audience/lifetime, clave >= 256 bits
+// Clave de laboratorio pública y predecible, incompatible con uso productivo.
+// FIX: validar issuer/audience/lifetime y usar una clave secreta segura.
 // G6-V2 VULNERABLE: JWT aceptado vía query string (?token=...) además del header Authorization.
 // Permite que el token aparezca en logs de servidor, historial de navegador y referrer headers.
 // FIX: eliminar OnMessageReceived y exigir exclusivamente el header Authorization: Bearer
@@ -49,7 +49,7 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             ValidateLifetime = false,       // Tokens nunca expiran
             ValidateIssuerSigningKey = true,
             IssuerSigningKey = new SymmetricSecurityKey(
-                Encoding.UTF8.GetBytes("weak-key"))
+                Encoding.UTF8.GetBytes(VulnerableApi.LabJwtSettings.SigningKey))
         };
 
         // G6-V2 VULNERABLE: lee el token del query string (?token=...)
